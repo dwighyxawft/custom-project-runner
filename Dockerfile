@@ -20,4 +20,4 @@ EXPOSE 3000
 EXPOSE 3001
 
 # Start the server
-CMD ["npm", "run", "start:prod"]
+CMD ["npm", "run", "start:dev"]
