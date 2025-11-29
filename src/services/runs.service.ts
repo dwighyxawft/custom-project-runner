@@ -1,5 +1,5 @@
 // src/services/runs.service.ts
-import { v4 as uuidv4 } from 'uuid';
+import uuid from 'uuid';
 import * as path from 'path';
 import fs from 'fs-extra';
 import * as unzipper from 'unzipper';
@@ -38,6 +38,8 @@ export class RunsService {
    * Main entrypoint called from controller
    */
   async createRunFromZip(buffer: Buffer) {
+      const { v4: uuidv4 } = uuid;
+
     const runId = uuidv4();
     const workspace = path.join(process.cwd(), 'workspace', runId);
     await fs.ensureDir(workspace);

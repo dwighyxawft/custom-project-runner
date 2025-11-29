@@ -22,7 +22,9 @@
   "dependencies": {
     "@nestjs/common": "^11.0.1",
     "@nestjs/core": "^11.0.1",
+    "@nestjs/mapped-types": "*",
     "@nestjs/platform-express": "^11.0.1",
+    "adm-zip": "^0.5.16",
     "dockerode": "^4.0.9",
     "fs-extra": "^11.3.2",
     "reflect-metadata": "^0.2.2",

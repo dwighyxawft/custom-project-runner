@@ -10,7 +10,6 @@ import { BuildManager } from './services/build.manager';
 import { RunManager } from './services/run.manager';
 
 @Module({
-  imports: [],
   controllers: [AppController, RunsController],
   providers: [AppService, RunsService, ProjectDetector, DockerfileGenerator, LogsGateway, BuildManager, RunManager],
 })
