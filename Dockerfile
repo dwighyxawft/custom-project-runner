@@ -1,5 +1,5 @@
 # Use Node.js LTS
-FROM node:18
+FROM node:20
 
 # Create app directory
 WORKDIR /app
