@@ -1,7 +1,7 @@
 // src/services/runs.service.ts
 import { v4 as uuidv4 } from 'uuid';
 import * as path from 'path';
-import fs from 'fs-extra';
+import * as fs from 'fs-extra';
 import * as unzipper from 'unzipper';
 import { ProjectDetector } from './project.detector';
 import { DockerfileGenerator } from './dockerfiles.generator';
