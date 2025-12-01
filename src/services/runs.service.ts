@@ -1,32 +1,32 @@
 // src/services/runs.service.ts
-import { v4 as _unused } from 'uuid'; // keep for types if needed; not used
+import { Injectable, Logger } from '@nestjs/common';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as unzipper from 'unzipper';
+import { Readable, PassThrough } from 'stream';
+import * as net from 'net';
+
 import { ProjectDetector } from './project.detector';
 import { DockerfileGenerator } from './dockerfiles.generator';
 import { BuildManager } from './build.manager';
 import { RunManager } from './run.manager';
 import { LogsGateway } from './logs.gateway';
-import { Injectable } from '@nestjs/common';
-import * as net from 'net';
-import { Readable } from 'stream';
-import { randomUUID } from 'crypto';
+
+type RunMeta = {
+  runId: string;
+  workspace: string;
+  imageTag: string;
+  containerId: string | null;
+  hostPort: number | null;
+  det: any;
+  status: 'running' | 'stopped' | 'error' | 'building';
+  createdAt: number;
+};
 
 @Injectable()
 export class RunsService {
-  private runs = new Map<
-    string,
-    {
-      runId: string;
-      workspace: string;
-      imageTag: string;
-      containerId: string | null;
-      hostPort: number;
-      det: any;
-      status: 'running' | 'stopped' | 'error';
-    }
-  >();
+  private readonly logger = new Logger(RunsService.name);
+  private runs = new Map<string, RunMeta>();
 
   constructor(
     private detector: ProjectDetector,
@@ -36,131 +36,224 @@ export class RunsService {
     private logsGateway: LogsGateway
   ) {}
 
+  /**
+   * Create a run from an uploaded zip buffer.
+   * Always returns an object containing runId and logsUrl so frontend can stream logs.
+   * If build+run succeed, httpUrl will also be returned.
+   */
   async createRunFromZip(buffer: Buffer) {
-    // use built-in Node UUID to avoid uuid ESM problems
-    const runId = randomUUID();
-    const workspace = path.join(process.cwd(), 'workspace', runId);
+    const runId = typeof (global as any).crypto?.randomUUID === 'function'
+      ? (global as any).crypto.randomUUID()
+      : this.fallbackUuid();
 
-    // ensure workspace exists
+    const workspace = path.join(process.cwd(), 'workspace', runId);
     await fs.ensureDir(workspace);
 
-    // extract zip
-    await this.extractZipToWorkspace(buffer, workspace);
-
-    // detect project
-    const det = await this.detector.detect(workspace);
-
-    // generate Dockerfile
-    await this.dockerfileGen.generate(det, workspace);
-    const imageTag = `runner:${runId}`;
-
-    // build image (emit build logs)
-    await this.builder.buildImage(workspace, imageTag, (msg) => {
-      try {
-        this.logsGateway.io.to(runId).emit('build_log', msg);
-      } catch (e) {}
-    });
-
-    const internalPort = det.port ?? 3000;
-    const hostPort = await this.getFreePort();
-
-    const runRes = await this.runner.runContainer(
-      {
-        imageTag,
-        runId,
-        port: internalPort,
-        hostPort,
-        memoryLimitMb: 512,
-        cpuQuota: 50000,
-      },
-      (log) => {
-        try {
-          this.logsGateway.io.to(runId).emit('log', log);
-        } catch (e) {}
-      }
-    );
-
-    const metadata = {
+    // Put initial metadata so frontend can query early
+    const initialMeta: RunMeta = {
       runId,
       workspace,
-      imageTag,
-      containerId: runRes.containerId,
-      hostPort: runRes.hostPort ?? hostPort,
-      det,
-      status: 'running' as const,
+      imageTag: `runner:${runId}`,
+      containerId: null,
+      hostPort: null,
+      det: null,
+      status: 'building',
+      createdAt: Date.now()
     };
-
-    this.runs.set(runId, metadata);
+    this.runs.set(runId, initialMeta);
 
     const host = process.env.RUNNER_HOST || 'localhost';
-    const ws = process.env.WS_PORT || 3001;
+    const wsPort = process.env.WS_PORT || 3001;
 
+    // Immediately return runId and logsUrl so frontend can connect to websocket
+    // Build and run are performed asynchronously below — but we still await the build so
+    // we can return httpUrl when successful. If you want purely async fire-and-forget,
+    // you can spawn a background task instead.
+    try {
+      // extract zip
+      await this.extractZipToWorkspace(buffer, workspace);
+      this.logger.log(`[${runId}] extracted workspace`);
+
+      // detect project
+      const det = await this.detector.detect(workspace);
+      initialMeta.det = det;
+      this.logger.log(`[${runId}] detected project: ${JSON.stringify(det)}`);
+
+      // generate Dockerfile
+      await this.dockerfileGen.generate(det, workspace);
+      this.logger.log(`[${runId}] dockerfile generated`);
+
+      // build image (stream build logs to websocket)
+      await this.builder.buildImage(workspace, initialMeta.imageTag, (msg) => {
+        this.logsGateway.io.to(runId).emit('build_log', String(msg));
+      });
+
+      this.logger.log(`[${runId}] build finished`);
+
+      // allocate host port and run container
+      const internalPort = det.port ?? 3000;
+      const hostPort = await this.getFreePort();
+      const runRes = await this.runner.runContainer(
+        {
+          imageTag: initialMeta.imageTag,
+          runId,
+          port: internalPort,
+          hostPort,
+          memoryLimitMb: 512,
+          cpuQuota: 50000,
+        },
+        (logLine) => {
+          // emit runtime logs
+          this.logsGateway.io.to(runId).emit('log', String(logLine));
+        }
+      );
+
+      // update metadata
+      initialMeta.containerId = runRes.containerId;
+      initialMeta.hostPort = runRes.hostPort ? Number(runRes.hostPort) : hostPort;
+      initialMeta.status = 'running';
+      this.runs.set(runId, initialMeta);
+
+      const httpUrl = `http://${host}:${initialMeta.hostPort}/`;
+      const logsUrl = `ws://${host}:${wsPort}`;
+
+      return { runId, logsUrl, httpUrl, hostPort: initialMeta.hostPort };
+    } catch (err) {
+      this.logger.error(`[${runId}] run failed`, err as any);
+
+      // emit the error to logs so frontend sees it too
+      this.logsGateway.io.to(runId).emit('build_log', `ERROR: ${(err as any)?.message || err}`);
+
+      // set status
+      const meta = this.runs.get(runId);
+      if (meta) meta.status = 'error';
+
+      // try cleanup of workspace and image if partially created
+      try {
+        await fs.remove(workspace);
+      } catch (e) {
+        this.logger.warn(`[${runId}] cleanup workspace failed: ${(e as any)?.message}`);
+      }
+      try {
+        // best-effort: remove image if it exists
+        await this.runner.removeImage(initialMeta.imageTag).catch(() => {});
+      } catch {}
+
+      // still return runId and logsUrl so frontend can inspect logs for failure diagnostics
+      const logsUrl = `ws://${host}:${wsPort}`;
+      return { runId, logsUrl, error: (err as any)?.message || String(err) };
+    }
+  }
+
+  /**
+   * Stops and cleans a run.
+   */
+  async stop(runId: string) {
+    const meta = this.runs.get(runId);
+    if (!meta) return { ok: false, error: 'run not found' };
+
+    if (meta.containerId) {
+      try {
+        await this.runner.stopContainer(meta.containerId);
+      } catch (e) {
+        this.logger.warn(`[${runId}] stopContainer error: ${(e as any)?.message}`);
+      }
+    }
+
+    try {
+      await this.cleanup(runId);
+    } catch (e) {
+      this.logger.warn(`[${runId}] cleanup after stop failed: ${(e as any)?.message}`);
+    }
+
+    return { ok: true };
+  }
+
+  /**
+   * Return status metadata for a run
+   */
+  getStatus(runId: string) {
+    const meta = this.runs.get(runId);
+    if (!meta) return { error: 'run not found' };
     return {
-      runId,
-      logsUrl: `ws://${host}:${ws}`,
-      httpUrl: `http://${host}:${metadata.hostPort}/`,
-      hostPort: metadata.hostPort,
+      runId: meta.runId,
+      status: meta.status,
+      hostPort: meta.hostPort,
+      containerId: meta.containerId,
+      detected: meta.det,
+      createdAt: meta.createdAt
     };
   }
 
-  private async extractZipToWorkspace(buffer: Buffer, workspace: string) {
+  /**
+   * Remove workspace + image + map cleanup
+   */
+  async cleanup(runId: string) {
+    const meta = this.runs.get(runId);
+    if (!meta) return;
+
+    // remove workspace dir
+    try {
+      await fs.remove(meta.workspace);
+    } catch (e) {
+      this.logger.warn(`[${runId}] failed to remove workspace: ${(e as any)?.message}`);
+    }
+
+    // remove image
+    if (meta.imageTag) {
+      try {
+        await this.runner.removeImage(meta.imageTag);
+      } catch (e) {
+        this.logger.warn(`[${runId}] failed to remove image: ${(e as any)?.message}`);
+      }
+    }
+
+    this.runs.delete(runId);
+  }
+
+  /**
+   * Extract zip buffer into workspace. Uses a PassThrough so unzipper receives a stream.
+   */
+  private extractZipToWorkspace(buffer: Buffer, workspace: string) {
     return new Promise<void>((resolve, reject) => {
-      const stream = unzipper.Extract({ path: workspace });
+      try {
+        // ensure directory exists (redundant but safe)
+        fs.ensureDirSync(workspace);
 
-      stream.on('close', resolve);
-      stream.on('error', reject);
+        const stream = unzipper.Extract({ path: workspace });
+        stream.on('close', () => resolve());
+        stream.on('error', (err) => reject(err));
 
-      // create a Readable from the buffer
-      const readable = new Readable();
-      readable._read = () => {};
-      readable.push(buffer);
-      readable.push(null);
-      readable.pipe(stream);
+        const pass = new PassThrough();
+        pass.end(buffer);
+        pass.pipe(stream);
+      } catch (err) {
+        reject(err);
+      }
     });
   }
 
+  /**
+   * Find a free port on host.
+   */
   private getFreePort(): Promise<number> {
     return new Promise((resolve, reject) => {
-      const srv = net.createServer();
-      srv.once('error', reject);
-      srv.listen(0, () => {
-        const addr = srv.address();
-        const port = typeof addr === 'string' ? 0 : (addr as any).port;
-        srv.close(() => resolve(port));
+      const server = net.createServer();
+      server.unref();
+      server.on('error', reject);
+      server.listen(0, () => {
+        const addr = server.address();
+        const port = typeof addr === 'object' && addr ? addr.port : undefined;
+        server.close(() => resolve(port as number));
       });
     });
   }
 
-  async stop(runId: string) {
-    const run = this.runs.get(runId);
-    if (!run) return;
-    if (run.containerId) {
-      await this.runner.stopContainer(run.containerId);
-    }
-    run.status = 'stopped';
-    await this.cleanup(runId);
-  }
-
-  getStatus(runId: string) {
-    return this.runs.get(runId) || { error: 'Run not found' };
-  }
-
-  async cleanup(runId: string) {
-    const run = this.runs.get(runId);
-    if (!run) return;
-
-    try {
-      await fs.remove(run.workspace);
-    } catch (e) {
-      console.error('Failed to remove workspace', e);
-    }
-
-    try {
-      await this.runner.removeImage(run.imageTag);
-    } catch (error) {
-      console.error(`Failed to remove image ${run.imageTag}:`, error);
-    }
-
-    this.runs.delete(runId);
+  /**
+   * Fallback uuid generation if crypto.randomUUID isn't available
+   */
+  private fallbackUuid() {
+    // simple fallback, not as strong as randomUUID but sufficient for runId uniqueness
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
   }
 }
