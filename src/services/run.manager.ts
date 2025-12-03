@@ -1,7 +1,7 @@
+// src/services/run.manager.ts
 import Dockerode = require('dockerode');
-import * as stream from 'stream';
 
-const docker = new Dockerode({ socketPath: '/var/run/docker.sock' });
+const defaultDocker = new Dockerode({ socketPath: '/var/run/docker.sock' });
 
 export interface RunOptions {
   imageTag: string;
@@ -16,8 +16,8 @@ export interface RunOptions {
 export class RunManager {
   private docker: Dockerode;
 
-  constructor() {
-    this.docker = new Dockerode({ socketPath: '/var/run/docker.sock' });
+  constructor(dockerClient?: Dockerode) {
+    this.docker = dockerClient || defaultDocker;
   }
 
   async runContainer(opts: RunOptions, onLog?: (chunk: string) => void) {
@@ -46,24 +46,26 @@ export class RunManager {
     await container.start();
 
     const inspect = await container.inspect();
-    const mappedPort =
-      inspect.NetworkSettings.Ports?.[`${port}/tcp`]?.[0]?.HostPort;
+    const mappedPort = inspect.NetworkSettings.Ports?.[`${port}/tcp`]?.[0]?.HostPort || null;
 
+    // stream logs
     const logStream = await container.logs({
       follow: true,
       stdout: true,
       stderr: true,
       since: 0,
-      tail: 100,
+      tail: 200,
     });
 
-    logStream.on('data', (chunk) => {
+    // logStream is a stream — pipe data
+    logStream.on('data', (chunk: Buffer) => {
       if (onLog) onLog(chunk.toString());
     });
 
-    container.wait().then((res) => {
-      if (onLog) onLog(`Container exited with ${JSON.stringify(res)}`);
-    });
+    // notify when container stops
+    container.wait().then((res: any) => {
+      if (onLog) onLog(`CONTAINER_EXIT: ${JSON.stringify(res)}`);
+    }).catch(() => {});
 
     return { containerId: container.id, hostPort: mappedPort };
   }
@@ -72,7 +74,9 @@ export class RunManager {
     const container = this.docker.getContainer(containerId);
     try {
       await container.stop({ t: 5 });
-    } catch {}
+    } catch (e) {
+      // ignore
+    }
     await container.remove({ force: true });
   }
 
