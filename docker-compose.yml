@@ -1,0 +1,5 @@
+services:
+  executor:
+    build: .
+    mem_limit: 1g
+    cpus: 1.5
